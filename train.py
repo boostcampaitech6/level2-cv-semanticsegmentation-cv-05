@@ -27,7 +27,7 @@ import wandb
 # visualization
 from dataset import *
 # model
-from model import UNet
+from model import DeepLabV3p
 
 #smp 사용시
 import segmentation_models_pytorch as smp
@@ -39,10 +39,10 @@ def parse_args():
     parser.add_argument("-lr", "--lr", dest="lr", default=1e-4, type=float)   
     parser.add_argument("--name", type=str, default="exp")   
     parser.add_argument("-s", "--seed", dest="seed", default=5252, type=int)   
-    parser.add_argument("-e", "--epoch", dest="epoch", default=100, type=int) 
+    parser.add_argument("-e", "--epoch", dest="epoch", default=200, type=int) 
     parser.add_argument("-v", "--val_every", dest="val_every", default=20, type=int)     
     parser.add_argument("-dir", "--saved_dir", dest="saved_dir", default="/data/ephemeral/home/segmentation/model", type=str)    
-    parser.add_argument("-name", "--model_name", dest="model_name", default="unet_best_model.pt", type=str)    
+    parser.add_argument("-name", "--model_name", dest="model_name", default="val2_fcn_aug_model.pt", type=str)    
     parser.add_argument("-w", "--weight_decay", dest="weight_decay", default=1e-6, type=float)   
     parser.add_argument("-l", "--loss", default='bce_loss', type=str) 
     parser.add_argument("-wb", "--entity", default= 'exp1', type=str)
@@ -71,9 +71,14 @@ wandb.init(
         config=args,
     )
 
-#Resize 
-tf = A.Resize(1024, 1024)
+#Augmentation 추가 
+tf = A.Compose([A.Resize(1024, 1024), 
+                A.HorizontalFlip(p=0.8)
+                ])
 train_dataset = XRayDataset(is_train=True, transforms=tf)
+
+#validation dataset
+tf = A.Resize(1024, 1024)
 valid_dataset = XRayDataset(is_train=False, transforms=tf)
 
 #train Dataloader
@@ -81,16 +86,16 @@ train_loader = DataLoader(
     dataset=train_dataset, 
     batch_size=args.batch_size,
     shuffle=True,
-    num_workers=4,
+    num_workers=8,
     drop_last=True,
 )
 
 #valid Dataloader 주의 : num_workers 커지지 않도록 
 valid_loader = DataLoader(
     dataset=valid_dataset, 
-    batch_size=2,
+    batch_size=1,
     shuffle=False,
-    num_workers=0,
+    num_workers=2,
     drop_last=False
 )
 
@@ -163,6 +168,22 @@ def validation(epoch, model, data_loader, criterion, thr=0.5):
     
     return avg_dice
 
+#dice loss 추가 
+def dice_loss(pred, target, smooth = 1.):
+    pred = pred.contiguous()
+    target = target.contiguous()   
+    intersection = (pred * target).sum(dim=2).sum(dim=2)
+    loss = (1 - ((2. * intersection + smooth) / (pred.sum(dim=2).sum(dim=2) +   target.sum(dim=2).sum(dim=2) + smooth)))
+    return loss.mean()
+
+#combined loss
+def calc_loss(pred, target, bce_weight = 0.5):
+    bce = F.binary_cross_entropy_with_logits(pred, target)
+    pred = F.sigmoid(pred)
+    dice = dice_loss(pred, target)
+    loss = bce * bce_weight + dice * (1 - bce_weight)
+    return loss
+
 def train(model, data_loader, val_loader, criterion, optimizer):
     print(f'Start training..')
     
@@ -208,22 +229,21 @@ def train(model, data_loader, val_loader, criterion, optimizer):
 
 ##TRAINING##
 #Custom model
-model = UNet(num_classes=len(CLASSES))
-                
-#smp
-# model 불러오기
-# 출력 label 수 정의 (classes=29)
-# model = smp.Unet(
-#     encoder_name="efficientnet-b0", # choose encoder, e.g. mobilenet_v2 or efficientnet-b7
-#     encoder_weights="imagenet",     # use `imagenet` pre-trained weights for encoder initialization
-#     in_channels=3,                  # model input channels (1 for gray-scale images, 3 for RGB, etc.)
-#     classes=29,                     # model output channels (number of classes in your dataset)
-# )
+#model = models.segmentation.fcn_resnet50(pretrained=True)
+           
+#smp model 
+
+model = smp.FPN(
+     encoder_name="resnet34", # choose encoder, e.g. mobilenet_v2 or efficientnet-b7
+     encoder_weights="imagenet",     # use `imagenet` pre-trained weights for encoder initialization
+     in_channels=3,                  # model input channels (1 for gray-scale images, 3 for RGB, etc.)
+     classes=29,                     # model output channels (number of classes in your dataset)
+ )
 
 wandb.watch(model)
 
 # Loss function
-criterion = nn.BCEWithLogitsLoss()
+criterion = calc_loss
 
 # Optimizer
 optimizer = optim.AdamW(params=model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
